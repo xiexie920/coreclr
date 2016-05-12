@@ -2065,7 +2065,9 @@ void                CodeGen::genCodeForBBlist()
             break;
 
         case BBJ_EHCATCHRET:
-            getEmitter()->emitIns_R_L(INS_adr, EA_4BYTE_DSP_RELOC, block->bbJumpDest, REG_INTRET);
+            // For long address (default): `adrp + add` will be emitted.
+            // For short address (proven later): `adr` will be emitted.
+            getEmitter()->emitIns_R_L(INS_adr, EA_PTRSIZE, block->bbJumpDest, REG_INTRET);
 
             __fallthrough;
 
@@ -2248,10 +2250,17 @@ void                CodeGen::genSetRegToConst(regNumber targetReg, var_types tar
             }
             else
             {
+                // Get a temp integer register to compute long address.
+                regMaskTP addrRegMask = tree->gtRsvdRegs;
+                regNumber addrReg = genRegNumFromMask(addrRegMask);
+                noway_assert(addrReg != REG_NA);
+
                 // We must load the FP constant from the constant pool
                 // Emit a data section constant for the float or double constant.
                 CORINFO_FIELD_HANDLE hnd = emit->emitFltOrDblConst(dblConst);
-                emit->emitIns_R_C(INS_ldr, size, targetReg, hnd, 0);
+                // For long address (default): `adrp + ldr + fmov` will be emitted.
+                // For short address (proven later), `ldr` will be emitted.
+                emit->emitIns_R_C(INS_ldr, size, targetReg, addrReg, hnd, 0);
             }
         }
         break;
@@ -3271,6 +3280,9 @@ CodeGen::genCodeForTreeNode(GenTreePtr treeNode)
     case GT_LABEL:
         genPendingCallLabel = genCreateTempLabel();
         treeNode->gtLabel.gtLabBB = genPendingCallLabel;
+
+        // For long address (default): `adrp + add` will be emitted.
+        // For short address (proven later): `adr` will be emitted.
         emit->emitIns_R_L(INS_adr, EA_PTRSIZE, genPendingCallLabel, targetReg);
         break;
 
@@ -3352,118 +3364,6 @@ CodeGen::genCodeForTreeNode(GenTreePtr treeNode)
         break;
     }
 }
-
-
-// Generate code for division (or mod) by power of two
-// or negative powers of two.  (meaning -1 * a power of two, not 2^(-1))
-// Op2 must be a contained integer constant.
-void
-CodeGen::genCodeForPow2Div(GenTreeOp* tree)
-{
-#if 0
-    GenTree *dividend = tree->gtOp.gtOp1;
-    GenTree *divisor  = tree->gtOp.gtOp2;
-    genTreeOps  oper  = tree->OperGet();
-    emitAttr    size  = emitTypeSize(tree);
-    emitter    *emit  = getEmitter();
-    regNumber targetReg  = tree->gtRegNum;
-    var_types targetType = tree->TypeGet();
-
-    bool isSigned = oper == GT_MOD || oper == GT_DIV;
-
-    // precondition: extended dividend is in RDX:RAX
-    // which means it is either all zeros or all ones
-
-    noway_assert(divisor->isContained());
-    GenTreeIntConCommon* divImm = divisor->AsIntConCommon();
-    int64_t imm = divImm->IconValue();
-    ssize_t abs_imm = abs(imm);
-    noway_assert(isPow2(abs_imm));
-    
-
-    if (isSigned)
-    {
-        if (imm == 1)
-        {
-            if (targetReg != REG_RAX)
-                inst_RV_RV(INS_mov, targetReg, REG_RAX, targetType);
-
-            return;
-        }
-
-        if (abs_imm == 2)
-        {
-            if (oper == GT_MOD)
-            {
-                emit->emitIns_R_I(INS_and, size, REG_RAX, 1); // result is 0 or 1
-                // xor with rdx will flip all bits if negative
-                emit->emitIns_R_R(INS_xor, size, REG_RAX, REG_RDX); // 111.11110 or 0
-            }
-            else
-            {
-                assert(oper == GT_DIV);
-                // add 1 if it's negative
-                emit->emitIns_R_R(INS_sub, size, REG_RAX, REG_RDX);
-            }
-        }
-        else
-        {
-            // add imm-1 if negative
-            emit->emitIns_R_I(INS_and, size, REG_RDX, abs_imm - 1);
-            emit->emitIns_R_R(INS_add, size, REG_RAX, REG_RDX);
-        }
-
-        if (oper == GT_DIV)
-        {
-            unsigned shiftAmount = genLog2(unsigned(abs_imm));
-            inst_RV_SH(INS_sar, size, REG_RAX, shiftAmount);
-
-            if (imm < 0)
-            {
-                emit->emitIns_R(INS_neg, size, REG_RAX);
-            }
-        }
-        else
-        {
-            assert(oper == GT_MOD);
-            if (abs_imm > 2)
-            {
-                emit->emitIns_R_I(INS_and, size, REG_RAX, abs_imm - 1);
-            }
-            // RDX contains 'imm-1' if negative
-            emit->emitIns_R_R(INS_sub, size, REG_RAX, REG_RDX);
-        }
-
-        if (targetReg != REG_RAX)
-        {
-            inst_RV_RV(INS_mov, targetReg, REG_RAX, targetType);
-        }
-    }
-    else
-    {
-        assert (imm > 0);
-
-        if (targetReg != dividend->gtRegNum)
-        {
-            inst_RV_RV(INS_mov, targetReg, dividend->gtRegNum, targetType);
-        }
-
-        if (oper == GT_UDIV)
-        {
-            inst_RV_SH(INS_shr, size, targetReg, genLog2(unsigned(imm)));
-        }
-        else 
-        {
-            assert(oper == GT_UMOD);
-
-            emit->emitIns_R_I(INS_and, size, targetReg, imm -1);
-        }
-    }
-#else // !0
-    NYI("genCodeForPow2Div");
-#endif // !0
-}
-
 
 /***********************************************************************************************
  *  Generate code for localloc
@@ -4203,6 +4103,7 @@ CodeGen::genJumpTable(GenTree* treeNode)
     getEmitter()->emitIns_R_C(INS_lea,
         emitTypeSize(TYP_I_IMPL),
         treeNode->gtRegNum,
+        REG_NA,
         compiler->eeFindJitDataOffs(jmpTabBase),
         0);
     genProduceReg(treeNode);
